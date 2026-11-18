@@ -4,7 +4,11 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from .models import Bale,Blend,BlendPortion
 from .quality_models import SupplierLot,LotBale,PelletCheck
+from .rework_models import ReworkOrder
 from .blending import obj,get,audit,view
+
+def reworked_kg(s,check_id):
+    return sum((x.kg for x in s.scalars(select(ReworkOrder).where(ReworkOrder.source_check_id==check_id))),Decimal(0))
 
 def lot_view(s,lot):
     return {**obj(lot),'bales':[{**obj(x),'bale_code':s.get(Bale,x.bale_id).code} for x in s.scalars(select(LotBale).where(LotBale.lot_id==lot.id).order_by(LotBale.bale_id))]}
@@ -23,9 +27,18 @@ def decide_lot(s,lid,data,u,target):
     reason=data.reason.strip()
     if len(reason)<8:raise HTTPException(409,'请填写至少8字的隔离或解除依据')
     lot.state=target;lot.inspection_note=reason;audit(s,u,'lot_'+target,lot.code+' / '+reason);return lot_view(s,lot)
-def pellet_view(s,x):return {**obj(x),'blend_code':s.get(Blend,x.blend_id).code}
+def pellet_view(s,x):
+    reworked=reworked_kg(s,x.id)
+    return {**obj(x),'blend_code':s.get(Blend,x.blend_id).code,
+            'reworked_kg':float(reworked),
+            'certifiable_kg':float((x.actual_kg-reworked).quantize(Decimal('.001')))}
 def measure(s,x,data,u,reason):
-    if data.actual_kg>Decimal(str(x.input_snapshot['total_kg'])):raise HTTPException(409,'粒料产出不能超过已放行实际投料总重')
+    total=Decimal(str(x.input_snapshot['total_kg']))
+    if data.actual_kg>total:raise HTTPException(409,'粒料产出不能超过已放行实际投料总重')
+    # Diverted weight has already left this lot: a new reading must stay at or above it,
+    # otherwise the same kg could be both reworked and sold.
+    diverted=reworked_kg(s,x.id)
+    if data.actual_kg<diverted:raise HTTPException(409,f'新检出{data.actual_kg}kg低于已返工{diverted}kg，返工重量不能再算可售产出')
     x.actual_kg=data.actual_kg;x.melt_index=data.melt_index;x.pvc_ppm=data.pvc_ppm
     x.state='quarantine' if data.pvc_ppm>x.input_snapshot['max_pvc'] else 'passed'
     record={'actual_kg':float(data.actual_kg),'melt_index':float(data.melt_index),'pvc_ppm':float(data.pvc_ppm),'result':x.state,'reason':reason,'actor':u['email'],'at':datetime.now(timezone.utc).isoformat()}
@@ -42,15 +55,22 @@ def create_pellet(s,data,u):
         else:snap['supplier_trace'].append({'bale_id':p['bale_id'],'lot_code':None,'legacy_unassigned':True})
     x=PelletCheck(blend_id=b.id,input_snapshot=snap,inspections=[]);measure(s,x,data,u,'首次成品取样');s.add(x);s.flush();return pellet_view(s,x)
 def retest(s,id,data,u):
-    x=get(s,PelletCheck,id,True)
+    x=get(s,PelletCheck,id,True)  # row lock: cannot run concurrently with certify/rework
     if x.state!='quarantine':raise HTTPException(409,'只有隔离粒料可复检，已合格或签证记录不可改写')
     if len(data.reason.strip())<8:raise HTTPException(409,'复检须填写至少8字的处置依据')
     measure(s,x,data,u,data.reason.strip());return pellet_view(s,x)
 def certify(s,id,u):
-    x=get(s,PelletCheck,id,True)
+    x=get(s,PelletCheck,id,True)  # row lock: cannot run concurrently with rework/retest
+    if x.state=='certified':raise HTTPException(409,'该粒料已签发合格证，不可重复发证')
     if x.state!='passed':raise HTTPException(409,'须PVC合格且未签证，隔离粒料不得发证')
     from .production_service import accepted_drying
+    from .rework_service import total_reworked_kg,certifiable_kg
+    reworked=total_reworked_kg(s,x.id,lock=True)
+    certifiable=certifiable_kg(s,x,lock=True)
+    if certifiable<=0:raise HTTPException(409,'粒料已全部返工拆出，没有可发证的可售重量')
     drying=accepted_drying(s,x.blend_id)
     x.certificate_code=f'HL-CERT-{x.id:06d}';x.certified_by=u['email'];x.state='certified'
-    x.certificate_snapshot={'code':x.certificate_code,'certified_by':u['email'],'at':datetime.now(timezone.utc).isoformat(),'input':x.input_snapshot,'measurements':x.inspections[-1],'inspection_count':len(x.inspections),'drying':drying}
+    x.certificate_snapshot={'code':x.certificate_code,'certified_by':u['email'],'at':datetime.now(timezone.utc).isoformat(),'input':x.input_snapshot,'measurements':x.inspections[-1],'inspection_count':len(x.inspections),'drying':drying,
+                            # Saleable output excludes every kg already diverted into rework.
+                            'reworked_kg':float(reworked),'certifiable_kg':float(certifiable.quantize(Decimal('.001')))}
     audit(s,u,'pellet_certified',x.certificate_code);return pellet_view(s,x)

@@ -50,7 +50,11 @@ def accepted_drying(s,blend_id):
     return dry_view(s,x)
 def available_pack_weight(s,p,kg,exclude=None):
     used=sum((x.kg for x in s.scalars(select(PelletPack).where(PelletPack.check_id==p.id,PelletPack.state!='cancelled').with_for_update().execution_options(populate_existing=True))if x.id!=exclude),Decimal(0))
-    if used+kg>p.actual_kg:raise HTTPException(409,'累计有效包装重量超过合格粒料产出，不分配超额箱码')
+    # Packaging can never exceed the certifiable (saleable) weight: output already
+    # diverted into rework bales is not available for sale.
+    from .rework_service import certifiable_kg
+    limit=certifiable_kg(s,p,lock=True)
+    if used+kg>limit:raise HTTPException(409,f'累计有效包装{used+kg}kg超过可发证重量{limit}kg（原产出{p.actual_kg}kg，已返工{p.actual_kg-limit}kg），不分配超额箱码')
 def create_pack(s,p,u):
     check=get(s,PelletCheck,p.check_id,True)
     if check.state!='certified':raise HTTPException(409,'仅主管已发合格证的成品可以包装')

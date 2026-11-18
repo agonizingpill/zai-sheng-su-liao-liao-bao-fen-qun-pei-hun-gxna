@@ -32,6 +32,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 6. 供应隔离复核：新批次记录供应商与首检依据；料包归属唯一，记录入批质量快照。主管隔离/解除必须填写至少8字依据。隔离批次阻止配方新审秤和已经ready配方最终投料；检查在原配混事务内生效。挂批、隔离和投料按料包→供应批顺序锁定。已投料料包禁止事后补挂，避免改变追溯。历史未挂批料仍保留原流程兼容性。
 7. 粒料检验放行：仅released配方取样，产出不得超过实际投料，MI必须正值；PVC大于原配方上限记录quarantine，合格记passed。隔离料可按依据追加复检，首次异常不覆盖。主管只可对passed记录发唯一HL-CERT证书，保存投料/称料/质量/来源与最新检验快照，之后不可重复发证或复检覆盖。
 
+7b. 隔离粒料返工拆包：隔离（quarantine）粒料可按重量拆出返工料包，取代手账返混。办理时在**一个事务**内先锁检验单行再校验：已签证（certified）料拒绝返工、合格（passed）料不返工只走复检发证；拆出重量不得超过「检出−已返工」的可拆余量，任一失败整体回滚，不会只扣源料或只建新包。成功后生成编号`RW-G{代}-{id}`的新料包（继承粒料MI/PVC、水分按投料快照加权，待重新分群），并登记`RWO`返工单，冻结原检验历次值与投料快照。源粒料的**可发证（可售）重量=检出重量−累计已返工重量**，复检新检出不得低于已返工量，包装累计与发证均以可发证重量为上限，已返工重量不会再算成可售产出。新包重新分群后按同群规则立单投料；再次产生隔离粒料仍可返工，`generation`递增、`root_check_id`回溯初代、`lineage`保存各代来源与累计重量。返工与复检/发证并发时，因都先`SELECT ... FOR UPDATE`锁同一检验单行，同一份料同时只准走一条去向；同单重试（同重量同依据或显式request_token）返回原返工单，不重复扣建。页面「隔离返工拆包」可办理拆出并核对**待返工、已返工、可发证**三类重量与各代血统。
+
 8. 烘干含水复检：主管登记Dryer设备，released配方开DryingRun，设备行锁核时段，配方唯一作业；投入含水由称料质量快照加权计算。含水>0.05%记redry，延烘结束不可倒退且须重查设备后续占用；复测≤0.05%记passed，主管验收accepted后才允许成品新签证，证书加入烘干快照；旧certified不重算。
 9. 包装箱码追溯：certified成品按唯一箱码分包，锁同成品校验有效包装累计≤actual_kg；open可改重或取消释放额度，sealed后冻结，证书快照随箱保存。已装车仍计入累计，避免重复包装同一产出。
 10. 装车客户签收：同车只能装同配方sealed箱，ShipmentPack.pack_id唯一，加载后包状态loaded阻止再次出库；主管发车保存冻结manifest。实收与清单差率绝对值>0.5%须至少8字依据，记录客户签收快照后不得重复签收。仅本地记录交接，无实际运输消息。
@@ -66,7 +68,9 @@ V3演练：11月24日DRY-B接BL-PELLET-UI的100kg投料，08:00—12:00烘干；
 
 V3 `backend/src/production_models.py`定义Dryer/DryingRun/PelletPack/BlendShipment/ShipmentPack；`production_schemas.py`校验时间、含水、称重与客户收货；`production_service.py`设备锁/时段重叠、累计包装锁、装车唯一和签收差率；`production_routes.py`提供`/dryers`、`/drying-runs`、`/pellet-packs`、`/blend-shipments`。新加5张表，原表列无变更，create_all兼容历史记录。
 
-`frontend/src/pages/yard.js`堆场；`clusters.js`真实散点与中心；`bench.js`可增删称料行；`release.js`交接簿；`lots.js`供应隔离复核；`pellets.js`粒料检验与证书；`drying.js`含水复检；`packs.js`包装箱码；`shipments.js`装车客户签收。`components/labels.js`共享群标签、状态条、标签页、标题与通知，群标签在图谱、秤台与放行中复用。`utils/api.js`会话/接口/store，`utils/format.js`数字/转义/上海时区。角色、配方状态、供应批、成品检验、烘干、包装和装车状态枚举定义在`backend/src/constants.py`、`frontend/src/constants.js`，状态实际转移在`blending.py`与`main.py`，标签渲染在`components/labels.js`。
+返工 `backend/src/rework_models.py`定义ReworkOrder（源检验单、新料包、拆出重量、代际generation、根检验root_check_id、自包含lineage血统与冻结source_snapshot）；`rework_schemas.py`校验重量/8字依据/幂等令牌；`rework_service.py`在检验单行锁内原子完成扣量与建包、代际与累计重量核算、可发证重量、同单幂等重试；`rework_routes.py`提供`/rework-orders`、`/pellet-checks/{id}/rework`（三类重量核对）、`/bales/{id}/lineage`（料包血统）。仅新增1张表，不改原表列，create_all兼容。`quality_service.py`的复检增加「新检出≥已返工」下限、发证快照写入reworked_kg/certifiable_kg；`production_service.py`包装上限改用可发证重量，杜绝返工量再销售。
+
+`frontend/src/pages/yard.js`堆场；`clusters.js`真实散点与中心；`bench.js`可增删称料行；`release.js`交接簿；`lots.js`供应隔离复核；`pellets.js`粒料检验与证书；`rework.js`隔离返工拆包（拆出办理、待返工/已返工/可发证重量核对、各代血统）；`drying.js`含水复检；`packs.js`包装箱码；`shipments.js`装车客户签收。`components/labels.js`共享群标签、状态条、标签页、标题与通知，群标签在图谱、秤台与放行中复用。`utils/api.js`会话/接口/store，`utils/format.js`数字/转义/上海时区。角色、配方状态、供应批、成品检验、烘干、包装和装车状态枚举定义在`backend/src/constants.py`、`frontend/src/constants.js`，状态实际转移在`blending.py`与`main.py`，标签渲染在`components/labels.js`。
 
 Compose恰好frontend/backend/worker/db/redis五服务，全部healthcheck。MySQL健康检查采用127.0.0.1业务账号SELECT1，避开初始化临时socket；前端和后端也用127.0.0.1。数据库、Redis和模型文件/心跳分别为命名卷。宿主默认地址池已用尽，本项目显式10.221.26.0/24；换环境冲突时调整networks。环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET。内网DATABASE_URL/REDIS_URL/SEED_DEMO由Compose设置。
 
